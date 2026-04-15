@@ -1,10 +1,8 @@
-cat > /root/pzmanager.sh << 'EOF'
+cat > pz.sh << 'EOF'
 #!/bin/bash
 #===============================================================================
-# Project Zomboid 服务器一键管理脚本 v6.4 (完整稳定版)
-# 改进：自动解决 libstdc++.i686 与 x86_64 的 Python 文件冲突
-#       彻底移除 dnf/yum 的 check-update 避免卡死
-#       中文语言设置于 -Djava.awt.headless=true 下方
+# Project Zomboid 服务器一键管理脚本 v6.5 (修复语法错误)
+# 改进：修正 set_game_language 中的 heredoc 问题，避免 else 意外错误
 #===============================================================================
 
 set -e
@@ -63,7 +61,6 @@ detect_distro() {
         UPDATE_CMD="apt update"
     elif command -v dnf &>/dev/null; then
         PKG_MANAGER="dnf"
-        # dnf 安装时添加超时、重试和允许覆盖冲突文件（解决 CentOS 9 文件冲突）
         INSTALL_CMD="dnf install -y --allowerasing --setopt=timeout=30 --setopt=retries=3"
         UPDATE_CMD=""
     elif command -v yum &>/dev/null; then
@@ -180,7 +177,6 @@ check_environment() {
 install_32bit_libs() {
     step "安装 32 位运行库"
 
-    # 针对 CentOS 9 / RHEL 9 的特殊处理：删除冲突的 Python 目录
     if [ -d "/usr/share/gcc-11/python/libstdcxx" ] && ( [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ] ); then
         warn "检测到 CentOS 9 风格的 libstdc++ Python 冲突目录，正在删除..."
         rm -rf /usr/share/gcc-11/python/libstdcxx
@@ -192,7 +188,6 @@ install_32bit_libs() {
             $INSTALL_CMD libc6-i386 libstdc++6:i386
             ;;
         dnf|yum)
-            # 直接安装（INSTALL_CMD 已包含 --allowerasing）
             $INSTALL_CMD glibc.i686 libstdc++.i686 2>/dev/null || {
                 warn "libstdc++.i686 安装失败，尝试仅安装 glibc.i686 和 libgcc.i686"
                 $INSTALL_CMD glibc.i686 libgcc.i686
@@ -280,7 +275,7 @@ detect_game_port() {
     fi
 }
 
-# ----------------------------- 防火墙智能提示（优化持久化）---------------------------------
+# ----------------------------- 防火墙智能提示 ---------------------------------
 check_firewall_and_prompt() {
     local tcp_port=$(get_config_port)
     local udp_port=$(get_config_udp_port)
@@ -404,7 +399,7 @@ update_game() {
     check_firewall_and_prompt
 }
 
-# ----------------------------- 设置中文语言（优化版）------------------------------------
+# ----------------------------- 设置中文语言（修复版）------------------------------------
 set_game_language() {
     step "设置游戏服务器中文语言"
     if [ ! -f "$JSON_FILE" ]; then
@@ -423,26 +418,28 @@ set_game_language() {
     fi
 
     if command -v python3 >/dev/null 2>&1; then
-        python3 << EOF
+        # 使用 Python -c 执行单行命令，避免 heredoc 问题
+        python3 -c "
 import json
-with open("$JSON_FILE", 'r') as f:
+import sys
+with open('$JSON_FILE', 'r') as f:
     data = json.load(f)
-if "vmArgs" in data and isinstance(data["vmArgs"], list):
-    args = data["vmArgs"]
-    if not any("-Duser.language=cn" in arg for arg in args):
+if 'vmArgs' in data and isinstance(data['vmArgs'], list):
+    args = data['vmArgs']
+    if not any('-Duser.language=cn' in arg for arg in args):
         insert_pos = -1
         for i, arg in enumerate(args):
-            if "-Djava.awt.headless=true" in arg:
+            if '-Djava.awt.headless=true' in arg:
                 insert_pos = i + 1
                 break
         if insert_pos == -1:
             insert_pos = len(args)
-        args.insert(insert_pos, "-Duser.language=cn")
-        if not any("-Duser.country=CN" in arg for arg in args):
-            args.insert(insert_pos + 1, "-Duser.country=CN")
-with open("$JSON_FILE", 'w') as f:
+        args.insert(insert_pos, '-Duser.language=cn')
+        if not any('-Duser.country=CN' in arg for arg in args):
+            args.insert(insert_pos + 1, '-Duser.country=CN')
+with open('$JSON_FILE', 'w') as f:
     json.dump(data, f, indent=2)
-EOF
+"
         if [ $? -eq 0 ]; then
             info "中文语言参数已成功添加（使用 Python）。"
         else
@@ -1043,7 +1040,7 @@ submenu_autoheal() {
     done
 }
 
-# ----------------------------- 删除存档（路径校验优化）--------------------------------------
+# ----------------------------- 删除存档 --------------------------------------
 delete_map() {
     step "删除存档"
     local save_base="$SAVE_DIR"
@@ -1225,7 +1222,7 @@ main() {
     check_user
     check_environment
 
-    info "PZ 服务器管理脚本 v6.4 启动"
+    info "PZ 服务器管理脚本 v6.5 启动"
 
     if [ ! -d "$GAME_DIR" ] || [ ! -f "$GAME_DIR/start-server.sh" ]; then
         warn "游戏服务端未安装，开始初始化..."
@@ -1240,7 +1237,7 @@ main() {
     main_menu
 }
 
-# ----------------------------- 命令行参数（已修复端口检测）-----------------------------------
+# ----------------------------- 命令行参数 ------------------------------------
 if [ "$1" = "--check" ] || [ "$1" = "-c" ]; then
     detect_distro
     check_user
@@ -1261,3 +1258,6 @@ fi
 
 main "$@"
 EOF
+
+chmod +x pz.sh
+sudo ./pz.sh
