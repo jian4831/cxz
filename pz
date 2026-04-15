@@ -1,8 +1,8 @@
-cat > pz.sh << 'EOF'
 #!/bin/bash
 #===============================================================================
-# Project Zomboid 服务器一键管理脚本 v6.5 (修复语法错误)
-# 改进：修正 set_game_language 中的 heredoc 问题，避免 else 意外错误
+# Project Zomboid 服务器一键管理脚本 v6.6 (最终修复版)
+# 改进：Ubuntu/Debian 自动启用 i386 架构并正确安装 32 位库
+#       修复 heredoc 语法错误，增强稳定性
 #===============================================================================
 
 set -e
@@ -146,7 +146,7 @@ check_environment() {
 
     case $PKG_MANAGER in
         apt)
-            dpkg -s libc6-i386 libstdc++6:i386 &>/dev/null || need_install=1
+            dpkg -s libc6:i386 libstdc++6:i386 &>/dev/null || need_install=1
             ;;
         dnf|yum)
             rpm -q glibc.i686 libstdc++.i686 &>/dev/null || need_install=1
@@ -177,6 +177,7 @@ check_environment() {
 install_32bit_libs() {
     step "安装 32 位运行库"
 
+    # CentOS 9 / RHEL 9 特殊处理：删除冲突的 Python 目录
     if [ -d "/usr/share/gcc-11/python/libstdcxx" ] && ( [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ] ); then
         warn "检测到 CentOS 9 风格的 libstdc++ Python 冲突目录，正在删除..."
         rm -rf /usr/share/gcc-11/python/libstdcxx
@@ -184,8 +185,17 @@ install_32bit_libs() {
 
     case $PKG_MANAGER in
         apt)
-            $UPDATE_CMD
-            $INSTALL_CMD libc6-i386 libstdc++6:i386
+            # Ubuntu/Debian: 启用 i386 架构
+            if ! dpkg --print-foreign-architectures | grep -q i386; then
+                info "启用 i386 架构..."
+                dpkg --add-architecture i386
+                $UPDATE_CMD
+            fi
+            # 安装 32 位库，如果失败则尝试备用包名
+            if ! $INSTALL_CMD libc6:i386 libstdc++6:i386; then
+                warn "标准 32 位库安装失败，尝试使用备用包名..."
+                $INSTALL_CMD libc6-i386 libstdc++-i386-cross
+            fi
             ;;
         dnf|yum)
             $INSTALL_CMD glibc.i686 libstdc++.i686 2>/dev/null || {
@@ -399,7 +409,7 @@ update_game() {
     check_firewall_and_prompt
 }
 
-# ----------------------------- 设置中文语言（修复版）------------------------------------
+# ----------------------------- 设置中文语言 ----------------------------------
 set_game_language() {
     step "设置游戏服务器中文语言"
     if [ ! -f "$JSON_FILE" ]; then
@@ -418,10 +428,8 @@ set_game_language() {
     fi
 
     if command -v python3 >/dev/null 2>&1; then
-        # 使用 Python -c 执行单行命令，避免 heredoc 问题
         python3 -c "
 import json
-import sys
 with open('$JSON_FILE', 'r') as f:
     data = json.load(f)
 if 'vmArgs' in data and isinstance(data['vmArgs'], list):
@@ -701,17 +709,17 @@ create_service() {
         warn "服务文件已存在，将覆盖。"
     fi
 
-    cat > "$SERVICE_FILE" << EOF
+    cat > "$SERVICE_FILE" << 'EOF'
 [Unit]
 Description=Project Zomboid 专用服务器
 After=network.target
 
 [Service]
 Type=simple
-User=$PZ_USER
-WorkingDirectory=$GAME_DIR
-ExecStart=/bin/bash $GAME_DIR/start-server.sh
-ExecStop=/bin/kill -SIGINT \$MAINPID
+User=pzuser
+WorkingDirectory=/usr/local/games/project
+ExecStart=/bin/bash /usr/local/games/project/start-server.sh
+ExecStop=/bin/kill -SIGINT $MAINPID
 Restart=on-failure
 RestartSec=10
 
@@ -1222,7 +1230,7 @@ main() {
     check_user
     check_environment
 
-    info "PZ 服务器管理脚本 v6.5 启动"
+    info "PZ 服务器管理脚本 v6.6 启动"
 
     if [ ! -d "$GAME_DIR" ] || [ ! -f "$GAME_DIR/start-server.sh" ]; then
         warn "游戏服务端未安装，开始初始化..."
@@ -1257,7 +1265,3 @@ if [ "$1" = "--check" ] || [ "$1" = "-c" ]; then
 fi
 
 main "$@"
-EOF
-
-chmod +x pz.sh
-sudo ./pz.sh
