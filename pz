@@ -1,0 +1,1263 @@
+cat > /root/pzmanager.sh << 'EOF'
+#!/bin/bash
+#===============================================================================
+# Project Zomboid 服务器一键管理脚本 v6.4 (完整稳定版)
+# 改进：自动解决 libstdc++.i686 与 x86_64 的 Python 文件冲突
+#       彻底移除 dnf/yum 的 check-update 避免卡死
+#       中文语言设置于 -Djava.awt.headless=true 下方
+#===============================================================================
+
+set -e
+
+# ----------------------------- 配置变量 --------------------------------------
+STEAMCMD_DIR="/usr/local/steamcmd"
+GAME_DIR="/usr/local/games/project"
+STEAMCMD_URL="https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
+LOGIN_USER=""
+LOGIN_PASS=""
+SERVICE_NAME="pzserver"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+PZ_USER="pzuser"
+PZ_HOME="/home/${PZ_USER}"
+SERVER_CONFIG="${PZ_HOME}/Zomboid/Server/servertest.ini"
+SAVE_DIR="${PZ_HOME}/Zomboid/Saves/Multiplayer"
+CRON_MARKER="# PZ_AUTOHEAL_CRON"
+JSON_FILE="${GAME_DIR}/ProjectZomboid64.json"
+
+# 颜色定义
+if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors)" -ge 8 ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; NC=''
+fi
+
+info()  { echo -e "${GREEN}[信息]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[警告]${NC} $1"; }
+error() { echo -e "${RED}[错误]${NC} $1"; }
+step()  { echo -e "${BLUE}>>>${NC} $1"; }
+
+# ----------------------------- 系统检测（多发行版）------------------------------
+PKG_MANAGER=""
+INSTALL_CMD=""
+UPDATE_CMD=""
+OS=""
+VER=""
+
+detect_distro() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+        VER=$VERSION_ID
+    else
+        OS=$(uname -s)
+        VER=$(uname -r)
+    fi
+
+    if command -v apt &>/dev/null; then
+        PKG_MANAGER="apt"
+        INSTALL_CMD="apt install -y"
+        UPDATE_CMD="apt update"
+    elif command -v dnf &>/dev/null; then
+        PKG_MANAGER="dnf"
+        # dnf 安装时添加超时、重试和允许覆盖冲突文件（解决 CentOS 9 文件冲突）
+        INSTALL_CMD="dnf install -y --allowerasing --setopt=timeout=30 --setopt=retries=3"
+        UPDATE_CMD=""
+    elif command -v yum &>/dev/null; then
+        PKG_MANAGER="yum"
+        INSTALL_CMD="yum install -y --setopt=timeout=30 --setopt=retries=3"
+        UPDATE_CMD=""
+    elif command -v pacman &>/dev/null; then
+        PKG_MANAGER="pacman"
+        INSTALL_CMD="pacman -S --noconfirm"
+        UPDATE_CMD="pacman -Sy"
+    elif command -v zypper &>/dev/null; then
+        PKG_MANAGER="zypper"
+        INSTALL_CMD="zypper install -y"
+        UPDATE_CMD="zypper refresh"
+    elif command -v apk &>/dev/null; then
+        PKG_MANAGER="apk"
+        INSTALL_CMD="apk add"
+        UPDATE_CMD="apk update"
+    else
+        error "无法检测到支持的包管理器。"
+        exit 1
+    fi
+    info "检测到系统: $OS, 包管理器: $PKG_MANAGER"
+}
+
+# ----------------------------- 安全检查与用户创建 ------------------------------
+check_user() {
+    if [ "$EUID" -ne 0 ]; then
+        error "请使用 root 权限运行此脚本 (sudo $0)"
+        exit 1
+    fi
+
+    local user_exists=0
+    local game_installed=0
+    id "$PZ_USER" &>/dev/null && user_exists=1
+    [ -d "$GAME_DIR" ] && [ -f "$GAME_DIR/start-server.sh" ] && game_installed=1
+
+    if [ $user_exists -eq 1 ] && [ $game_installed -eq 1 ]; then
+        info "检测到运行环境已完整配置，跳过安全警告。"
+        PZ_HOME=$(eval echo "~$PZ_USER")
+        SERVER_CONFIG="${PZ_HOME}/Zomboid/Server/servertest.ini"
+        SAVE_DIR="${PZ_HOME}/Zomboid/Saves/Multiplayer"
+        mkdir -p "$GAME_DIR"
+        chown -R "$PZ_USER":"$PZ_USER" "$GAME_DIR"
+        chown -R "$PZ_USER":"$PZ_USER" "$STEAMCMD_DIR" 2>/dev/null || true
+        return
+    fi
+
+    echo ""
+    echo "============================================================"
+    echo "  ⚠️  安全警告：建议不要直接使用 root 用户运行游戏服务器！"
+    echo "============================================================"
+    echo "  本脚本将自动创建专用系统用户 '${PZ_USER}' 来运行服务。"
+    echo ""
+    read -p "是否继续？(Y/n): " user_confirm
+    if [[ "$user_confirm" =~ ^[Nn]$ ]]; then
+        info "已取消。"
+        exit 0
+    fi
+
+    if [ $user_exists -eq 0 ]; then
+        step "创建系统用户 ${PZ_USER}"
+        useradd -r -m -s /bin/bash -U "$PZ_USER"
+    fi
+
+    PZ_HOME=$(eval echo "~$PZ_USER")
+    SERVER_CONFIG="${PZ_HOME}/Zomboid/Server/servertest.ini"
+    SAVE_DIR="${PZ_HOME}/Zomboid/Saves/Multiplayer"
+
+    mkdir -p "$GAME_DIR"
+    chown -R "$PZ_USER":"$PZ_USER" "$GAME_DIR"
+    chown -R "$PZ_USER":"$PZ_USER" "$STEAMCMD_DIR" 2>/dev/null || true
+
+    info "已切换到以用户 '${PZ_USER}' 运行游戏服务。"
+}
+
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# ----------------------------- 运行环境检查与修复 ------------------------------
+check_environment() {
+    step "检查系统运行环境"
+    local need_install=0
+
+    case $PKG_MANAGER in
+        apt)
+            dpkg -s libc6-i386 libstdc++6:i386 &>/dev/null || need_install=1
+            ;;
+        dnf|yum)
+            rpm -q glibc.i686 libstdc++.i686 &>/dev/null || need_install=1
+            ;;
+        pacman)
+            pacman -Q lib32-gcc-libs &>/dev/null || need_install=1
+            ;;
+        zypper)
+            rpm -q glibc-32bit libstdc++6-32bit &>/dev/null || need_install=1
+            ;;
+        apk)
+            apk info libc6-compat gcompat &>/dev/null || need_install=1
+            ;;
+        *)
+            warn "未知包管理器，跳过依赖检查。"
+            return
+            ;;
+    esac
+
+    if [ $need_install -eq 1 ]; then
+        warn "运行库缺失，正在安装..."
+        install_32bit_libs
+    else
+        info "运行环境正常。"
+    fi
+}
+
+install_32bit_libs() {
+    step "安装 32 位运行库"
+
+    # 针对 CentOS 9 / RHEL 9 的特殊处理：删除冲突的 Python 目录
+    if [ -d "/usr/share/gcc-11/python/libstdcxx" ] && ( [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ] ); then
+        warn "检测到 CentOS 9 风格的 libstdc++ Python 冲突目录，正在删除..."
+        rm -rf /usr/share/gcc-11/python/libstdcxx
+    fi
+
+    case $PKG_MANAGER in
+        apt)
+            $UPDATE_CMD
+            $INSTALL_CMD libc6-i386 libstdc++6:i386
+            ;;
+        dnf|yum)
+            # 直接安装（INSTALL_CMD 已包含 --allowerasing）
+            $INSTALL_CMD glibc.i686 libstdc++.i686 2>/dev/null || {
+                warn "libstdc++.i686 安装失败，尝试仅安装 glibc.i686 和 libgcc.i686"
+                $INSTALL_CMD glibc.i686 libgcc.i686
+            }
+            ;;
+        pacman)
+            $UPDATE_CMD
+            $INSTALL_CMD lib32-gcc-libs
+            ;;
+        zypper)
+            $INSTALL_CMD glibc-32bit libstdc++6-32bit
+            ;;
+        apk)
+            $INSTALL_CMD libc6-compat gcompat
+            ;;
+    esac
+    info "32位运行库安装完成。"
+}
+
+# ----------------------------- SteamCMD 初始化 --------------------------------
+init_steamcmd() {
+    step "初始化 SteamCMD 环境"
+    mkdir -p "$STEAMCMD_DIR"
+    cd "$STEAMCMD_DIR"
+
+    if [ ! -f "./steamcmd.sh" ]; then
+        info "下载 steamcmd ..."
+        wget "$STEAMCMD_URL" -O steamcmd_linux.tar.gz
+        tar -zxvf steamcmd_linux.tar.gz
+        rm -f steamcmd_linux.tar.gz
+    else
+        info "SteamCMD 已存在。"
+    fi
+
+    if [ ! -d "$HOME/Steam" ]; then
+        ./steamcmd.sh +quit || true
+    fi
+    chown -R "$PZ_USER":"$PZ_USER" "$STEAMCMD_DIR"
+}
+
+# ----------------------------- 配置读取辅助 ------------------------------------
+get_config() {
+    local key="$1"
+    local file="$2"
+    if [ -f "$file" ]; then
+        grep -E "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d'=' -f2- || true
+    fi
+}
+
+set_config() {
+    local key="$1"
+    local value="$2"
+    local file="$3"
+    if grep -q "^${key}=" "$file" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+    else
+        echo "${key}=${value}" >> "$file"
+    fi
+}
+
+get_config_port() {
+    local port=$(get_config "DefaultPort" "$SERVER_CONFIG")
+    [ -z "$port" ] && port=$(get_config "Port" "$SERVER_CONFIG")
+    echo "${port:-8766}"
+}
+
+get_config_udp_port() {
+    local port=$(get_config "UDPPort" "$SERVER_CONFIG")
+    echo "${port:-16261}"
+}
+
+detect_game_port() {
+    local proc_pid=$(pgrep -f "ProjectZomboid64" | head -1)
+    [ -z "$proc_pid" ] && { get_config_port; return; }
+
+    if cmd_exists ss; then
+        ss -tlnp 2>/dev/null | awk -v pid="$proc_pid" '$NF ~ pid && $5 !~ /127\.0\.0\.1/ {split($5,a,":"); print a[2]}' | head -1
+    elif cmd_exists lsof; then
+        lsof -a -p "$proc_pid" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | grep -E '^n\*:[0-9]+' | head -1 | cut -d: -f2
+    elif cmd_exists netstat; then
+        netstat -tlnp 2>/dev/null | awk -v pid="$proc_pid" '$NF ~ pid && $4 !~ /127\.0\.0\.1/ {split($4,a,":"); print a[2]}' | head -1
+    else
+        warn "未安装 ss/lsof/netstat，无法探测实际监听端口，使用配置端口。"
+        get_config_port
+    fi
+}
+
+# ----------------------------- 防火墙智能提示（优化持久化）---------------------------------
+check_firewall_and_prompt() {
+    local tcp_port=$(get_config_port)
+    local udp_port=$(get_config_udp_port)
+
+    echo ""
+    step "防火墙状态检测"
+
+    local fw_installed=0
+    local FW_TYPE=""
+    if command -v ufw &>/dev/null; then
+        fw_installed=1
+        FW_TYPE="ufw"
+    elif command -v firewall-cmd &>/dev/null; then
+        fw_installed=1
+        FW_TYPE="firewalld"
+    elif command -v iptables &>/dev/null; then
+        fw_installed=1
+        FW_TYPE="iptables"
+    fi
+
+    if [ $fw_installed -eq 1 ]; then
+        info "检测到防火墙: $FW_TYPE"
+        read -p "是否自动添加端口放行规则 (TCP ${tcp_port}, UDP ${udp_port})？(Y/n): " fw_choice
+        if [[ ! "$fw_choice" =~ ^[Nn]$ ]]; then
+            case $FW_TYPE in
+                ufw)
+                    ufw allow ${tcp_port}/tcp
+                    ufw allow ${udp_port}/udp
+                    ufw --force enable
+                    info "UFW 规则已添加。"
+                    ;;
+                firewalld)
+                    systemctl start firewalld 2>/dev/null || true
+                    firewall-cmd --zone=public --add-port=${tcp_port}/tcp --permanent
+                    firewall-cmd --zone=public --add-port=${udp_port}/udp --permanent
+                    firewall-cmd --reload
+                    info "firewalld 规则已添加。"
+                    ;;
+                iptables)
+                    iptables -I INPUT -p tcp --dport ${tcp_port} -j ACCEPT
+                    iptables -I INPUT -p udp --dport ${udp_port} -j ACCEPT
+                    if command -v iptables-save >/dev/null 2>&1; then
+                        if command -v netfilter-persistent >/dev/null 2>&1; then
+                            netfilter-persistent save
+                        elif command -v iptables-persistent >/dev/null 2>&1; then
+                            iptables-persistent save
+                        else
+                            mkdir -p /etc/iptables
+                            iptables-save > /etc/iptables/rules.v4
+                            warn "iptables 规则已保存到 /etc/iptables/rules.v4，请确保系统启动时自动恢复。"
+                        fi
+                    fi
+                    info "iptables 规则已添加。"
+                    ;;
+            esac
+        else
+            info "已跳过防火墙自动配置。"
+        fi
+    else
+        warn "未检测到已安装的防火墙管理工具 (ufw/firewalld/iptables)。"
+    fi
+
+    echo ""
+    warn "重要：请确保云服务商的安全组/防火墙已放行以下端口："
+    echo "      TCP: ${tcp_port}"
+    echo "      UDP: ${udp_port}"
+    echo ""
+    read -p "按回车键继续..."
+}
+
+# ----------------------------- Steam 登录选择 ---------------------------------
+choose_login() {
+    step "Steam 登录方式选择"
+    echo "1) 匿名登录 (anonymous)  [推荐]"
+    echo "2) 使用 Steam 账号登录"
+    echo -n "请选择 [1/2] (10秒无输入自动选1): "
+    if read -t 10 login_choice; then
+        echo
+    else
+        echo
+        info "已超时，自动选择匿名登录。"
+        login_choice="1"
+    fi
+    case $login_choice in
+        1) LOGIN_USER="anonymous"; LOGIN_PASS=""; info "已选择匿名登录。" ;;
+        2) 
+            warn "密码可能暴露，注意安全。"
+            read -p "Steam 账号: " LOGIN_USER
+            set +o history
+            read -s -p "Steam 密码: " LOGIN_PASS; echo
+            set -o history
+            ;;
+        *) LOGIN_USER="anonymous"; LOGIN_PASS=""; warn "默认匿名登录。" ;;
+    esac
+}
+
+run_steamcmd() {
+    cd "$STEAMCMD_DIR"
+    local temp_log=$(mktemp)
+    trap 'rm -f "$temp_log"' EXIT
+    if [ "$LOGIN_USER" = "anonymous" ]; then
+        sudo -u "$PZ_USER" ./steamcmd.sh +login anonymous +force_install_dir "$GAME_DIR" "$@" +quit 2>&1 | tee "$temp_log"
+    else
+        sudo -u "$PZ_USER" ./steamcmd.sh +login "$LOGIN_USER" "$LOGIN_PASS" +force_install_dir "$GAME_DIR" "$@" +quit 2>&1 | tee "$temp_log"
+    fi
+    if grep -qi "FAILED\|ERROR\|No connection" "$temp_log"; then
+        error "SteamCMD 执行失败，请检查网络或登录信息。"
+        exit 1
+    fi
+    rm -f "$temp_log"
+    trap - EXIT
+}
+
+# ----------------------------- 游戏更新 --------------------------------------
+update_game() {
+    step "更新/安装 Project Zomboid 服务端"
+    mkdir -p "$GAME_DIR"
+    run_steamcmd "+app_update 380870 validate"
+    chmod +x "$GAME_DIR/start-server.sh" 2>/dev/null || true
+    info "游戏服务端更新完成。"
+    check_firewall_and_prompt
+}
+
+# ----------------------------- 设置中文语言（优化版）------------------------------------
+set_game_language() {
+    step "设置游戏服务器中文语言"
+    if [ ! -f "$JSON_FILE" ]; then
+        error "找不到 ProjectZomboid64.json 文件，请先安装/更新游戏。"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+
+    cp "$JSON_FILE" "${JSON_FILE}.bak"
+    
+    if grep -q '"-Duser.language=cn"' "$JSON_FILE"; then
+        info "中文语言参数已存在，无需重复添加。"
+        chown "$PZ_USER":"$PZ_USER" "$JSON_FILE"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 << EOF
+import json
+with open("$JSON_FILE", 'r') as f:
+    data = json.load(f)
+if "vmArgs" in data and isinstance(data["vmArgs"], list):
+    args = data["vmArgs"]
+    if not any("-Duser.language=cn" in arg for arg in args):
+        insert_pos = -1
+        for i, arg in enumerate(args):
+            if "-Djava.awt.headless=true" in arg:
+                insert_pos = i + 1
+                break
+        if insert_pos == -1:
+            insert_pos = len(args)
+        args.insert(insert_pos, "-Duser.language=cn")
+        if not any("-Duser.country=CN" in arg for arg in args):
+            args.insert(insert_pos + 1, "-Duser.country=CN")
+with open("$JSON_FILE", 'w') as f:
+    json.dump(data, f, indent=2)
+EOF
+        if [ $? -eq 0 ]; then
+            info "中文语言参数已成功添加（使用 Python）。"
+        else
+            warn "Python 处理失败，尝试 sed 备用方案。"
+            sed -i '/"-Djava.awt.headless=true"/a \            "-Duser.language=cn",\n            "-Duser.country=CN"' "$JSON_FILE"
+        fi
+    else
+        sed -i '/"-Djava.awt.headless=true"/a \            "-Duser.language=cn",\n            "-Duser.country=CN"' "$JSON_FILE"
+        info "已添加中文语言参数。"
+    fi
+
+    chown "$PZ_USER":"$PZ_USER" "$JSON_FILE"
+    info "中文语言设置完成。重启服务器后生效。"
+    read -p "按回车键返回主菜单..."
+}
+
+# ----------------------------- 交互式配置向导 ---------------------------------
+modify_config() {
+    step "交互式配置服务器参数"
+    
+    if [ ! -f "$SERVER_CONFIG" ]; then
+        warn "配置文件不存在: $SERVER_CONFIG"
+        read -p "是否现在创建默认配置目录？(y/N): " create_confirm
+        if [[ "$create_confirm" =~ ^[Yy]$ ]]; then
+            mkdir -p "$(dirname "$SERVER_CONFIG")"
+            touch "$SERVER_CONFIG"
+            chown "$PZ_USER":"$PZ_USER" "$(dirname "$SERVER_CONFIG")"
+            info "已创建空配置文件。"
+        else
+            return
+        fi
+    fi
+
+    [ -f "$SERVER_CONFIG" ] && cp "$SERVER_CONFIG" "${SERVER_CONFIG}.bak" 2>/dev/null && info "原配置已备份至 ${SERVER_CONFIG}.bak"
+
+    echo ""
+    info "开始逐项配置，直接回车将保留当前值。"
+
+    local old_tcp=$(get_config_port)
+    local old_udp=$(get_config_udp_port)
+
+    # 1. 服务器名称
+    local cur_name=$(get_config "PublicName" "$SERVER_CONFIG")
+    [ -z "$cur_name" ] && cur_name="My PZ Server"
+    echo "当前服务器名称: ${cur_name}"
+    read -p "请输入新的服务器名称 [${cur_name}]: " new_name
+    [ -n "$new_name" ] && cur_name="$new_name"
+    set_config "PublicName" "$cur_name" "$SERVER_CONFIG"
+    info "服务器名称已设置为: $cur_name"
+    echo ""
+
+    # 2. 密码
+    local cur_pass=$(get_config "PublicPassword" "$SERVER_CONFIG")
+    echo "当前服务器密码: [${cur_pass:-无密码}]"
+    read -p "请输入新的服务器密码（留空则无密码）: " new_pass
+    if [ "$new_pass" != "" ]; then
+        set_config "PublicPassword" "$new_pass" "$SERVER_CONFIG"
+        info "服务器密码已设置。"
+    else
+        if [ -n "$cur_pass" ]; then
+            read -p "是否清除密码？(y/N): " clear_pass
+            if [[ "$clear_pass" =~ ^[Yy]$ ]]; then
+                set_config "PublicPassword" "" "$SERVER_CONFIG"
+                info "密码已清除。"
+            else
+                info "保留原密码。"
+            fi
+        else
+            info "保持无密码状态。"
+        fi
+    fi
+    echo ""
+
+    # 3. 最大玩家数
+    local cur_max=$(get_config "MaxPlayers" "$SERVER_CONFIG")
+    [ -z "$cur_max" ] && cur_max="16"
+    echo "当前最大玩家数: $cur_max"
+    while true; do
+        read -p "请输入最大玩家数 [${cur_max}]: " new_max
+        [ -z "$new_max" ] && new_max="$cur_max"
+        if [[ "$new_max" =~ ^[0-9]+$ ]] && [ "$new_max" -gt 0 ]; then
+            break
+        else
+            error "请输入有效的正整数。"
+        fi
+    done
+    set_config "MaxPlayers" "$new_max" "$SERVER_CONFIG"
+    info "最大玩家数已设置为: $new_max"
+    echo ""
+
+    # 4. 公开
+    local cur_open=$(get_config "Open" "$SERVER_CONFIG")
+    [ -z "$cur_open" ] && cur_open="true"
+    echo "当前公开状态: $cur_open (true=公开, false=私人)"
+    read -p "是否公开服务器？(true/false) [${cur_open}]: " new_open
+    [ -z "$new_open" ] && new_open="$cur_open"
+    if [[ "$new_open" != "true" && "$new_open" != "false" ]]; then
+        warn "输入无效，保留原值: $cur_open"
+        new_open="$cur_open"
+    fi
+    set_config "Open" "$new_open" "$SERVER_CONFIG"
+    info "公开状态已设置为: $new_open"
+    echo ""
+
+    # 5. TCP 端口
+    local cur_port=$(get_config_port)
+    echo "当前游戏 TCP 端口 (DefaultPort): $cur_port"
+    while true; do
+        read -p "请输入 TCP 端口 [${cur_port}]: " new_port
+        [ -z "$new_port" ] && new_port="$cur_port"
+        if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65535 ]; then
+            break
+        else
+            error "请输入 1024-65535 之间的有效端口号。"
+        fi
+    done
+    set_config "DefaultPort" "$new_port" "$SERVER_CONFIG"
+    info "TCP 端口已设置为: $new_port"
+    echo ""
+
+    # 6. UDP 端口
+    local cur_udp=$(get_config_udp_port)
+    echo "当前 UDP 端口: $cur_udp"
+    while true; do
+        read -p "请输入 UDP 端口 [${cur_udp}]: " new_udp
+        [ -z "$new_udp" ] && new_udp="$cur_udp"
+        if [[ "$new_udp" =~ ^[0-9]+$ ]] && [ "$new_udp" -ge 1024 ] && [ "$new_udp" -le 65535 ]; then
+            break
+        else
+            error "请输入 1024-65535 之间的有效端口号。"
+        fi
+    done
+    set_config "UDPPort" "$new_udp" "$SERVER_CONFIG"
+    info "UDP 端口已设置为: $new_udp"
+    echo ""
+
+    # 7. PVP
+    local cur_pvp=$(get_config "PVP" "$SERVER_CONFIG")
+    [ -z "$cur_pvp" ] && cur_pvp="true"
+    echo "当前 PVP 状态: $cur_pvp"
+    read -p "是否启用 PVP？(true/false) [${cur_pvp}]: " new_pvp
+    [ -z "$new_pvp" ] && new_pvp="$cur_pvp"
+    if [[ "$new_pvp" != "true" && "$new_pvp" != "false" ]]; then
+        warn "输入无效，保留原值: $cur_pvp"
+        new_pvp="$cur_pvp"
+    fi
+    set_config "PVP" "$new_pvp" "$SERVER_CONFIG"
+    info "PVP 状态已设置为: $new_pvp"
+    echo ""
+
+    # 8. 空服暂停
+    local cur_pause=$(get_config "PauseEmpty" "$SERVER_CONFIG")
+    [ -z "$cur_pause" ] && cur_pause="true"
+    echo "当前空服暂停: $cur_pause"
+    read -p "是否启用空服暂停？(true/false) [${cur_pause}]: " new_pause
+    [ -z "$new_pause" ] && new_pause="$cur_pause"
+    if [[ "$new_pause" != "true" && "$new_pause" != "false" ]]; then
+        warn "输入无效，保留原值: $cur_pause"
+        new_pause="$cur_pause"
+    fi
+    set_config "PauseEmpty" "$new_pause" "$SERVER_CONFIG"
+    info "空服暂停已设置为: $new_pause"
+    echo ""
+
+    # 9. 反作弊保护
+    echo "反作弊保护（批量设置 AntiCheatProtectionType1-24）"
+    local cur_anti_sample=$(get_config "AntiCheatProtectionType1" "$SERVER_CONFIG")
+    [ -z "$cur_anti_sample" ] && cur_anti_sample="true"
+    echo "当前反作弊状态示例 (Type1): $cur_anti_sample"
+    read -p "是否启用所有反作弊保护？(true/false) [${cur_anti_sample}]: " new_anti
+    [ -z "$new_anti" ] && new_anti="$cur_anti_sample"
+    if [[ "$new_anti" != "true" && "$new_anti" != "false" ]]; then
+        warn "输入无效，保留原值。"
+    else
+        for i in {1..24}; do
+            set_config "AntiCheatProtectionType${i}" "$new_anti" "$SERVER_CONFIG"
+        done
+        info "所有 24 项反作弊保护已统一设置为: $new_anti"
+    fi
+    echo ""
+
+    # 10. 白名单设置
+    echo "============================================================"
+    echo "                    白名单 (Whitelist) 设置                  "
+    echo "============================================================"
+    local cur_whitelist=$(get_config "Whitelist" "$SERVER_CONFIG")
+    [ -z "$cur_whitelist" ] && cur_whitelist="false"
+    echo "当前白名单状态: $cur_whitelist"
+    echo ""
+    echo "说明："
+    echo "  - 启用白名单后，只有白名单内的玩家才能加入服务器。"
+    echo "  - 白名单文件位置: ${PZ_HOME}/Zomboid/Server/whitelist.txt"
+    echo "  - 每行一个 SteamID64（如 76561198012345678）"
+    echo "  - 建议配合 Open=false（私人服务器）使用。"
+    echo ""
+    read -p "是否启用白名单？(true/false) [${cur_whitelist}]: " new_whitelist
+    [ -z "$new_whitelist" ] && new_whitelist="$cur_whitelist"
+    if [[ "$new_whitelist" != "true" && "$new_whitelist" != "false" ]]; then
+        warn "输入无效，保留原值: $cur_whitelist"
+        new_whitelist="$cur_whitelist"
+    fi
+    set_config "Whitelist" "$new_whitelist" "$SERVER_CONFIG"
+    info "白名单状态已设置为: $new_whitelist"
+    
+    if [[ "$new_whitelist" == "true" ]]; then
+        local current_open=$(get_config "Open" "$SERVER_CONFIG")
+        if [[ "$current_open" == "true" ]]; then
+            warn "白名单已启用，但服务器仍为公开状态。"
+            read -p "是否自动将服务器设为私人 (Open=false)？(Y/n): " set_private
+            if [[ ! "$set_private" =~ ^[Nn]$ ]]; then
+                set_config "Open" "false" "$SERVER_CONFIG"
+                info "已将服务器公开状态设置为 false。"
+            else
+                info "保持公开状态不变（不推荐）。"
+            fi
+        fi
+        
+        local whitelist_file="${PZ_HOME}/Zomboid/Server/whitelist.txt"
+        if [ ! -f "$whitelist_file" ]; then
+            warn "白名单文件不存在，正在创建空文件..."
+            mkdir -p "$(dirname "$whitelist_file")"
+            touch "$whitelist_file"
+            chown "$PZ_USER":"$PZ_USER" "$whitelist_file"
+            info "已创建空白名单文件: $whitelist_file"
+            echo "请稍后编辑此文件添加玩家 SteamID64。"
+        else
+            info "白名单文件已存在: $whitelist_file"
+        fi
+    fi
+    echo ""
+
+    chown "$PZ_USER":"$PZ_USER" "$SERVER_CONFIG" 2>/dev/null || true
+
+    info "所有配置项已更新！"
+    echo "如需修改更多高级选项，可使用文本编辑器打开: $SERVER_CONFIG"
+
+    local new_tcp=$(get_config_port)
+    local new_udp=$(get_config_udp_port)
+
+    read -p "是否立即重启服务器使配置生效？(y/N): " restart_confirm
+    if [[ "$restart_confirm" =~ ^[Yy]$ ]]; then
+        info "正在重启服务器..."
+        systemctl restart "$SERVICE_NAME"
+        info "服务器已重启。"
+        sleep 3
+        deep_status_check
+    fi
+
+    if [ "$new_tcp" != "$old_tcp" ] || [ "$new_udp" != "$old_udp" ]; then
+        check_firewall_and_prompt
+    fi
+
+    read -p "按回车键返回主菜单..."
+}
+
+# ----------------------------- systemd 服务管理 ------------------------------
+create_service() {
+    if [ -f "$SERVICE_FILE" ]; then
+        warn "服务文件已存在，将覆盖。"
+    fi
+
+    cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=Project Zomboid 专用服务器
+After=network.target
+
+[Service]
+Type=simple
+User=$PZ_USER
+WorkingDirectory=$GAME_DIR
+ExecStart=/bin/bash $GAME_DIR/start-server.sh
+ExecStop=/bin/kill -SIGINT \$MAINPID
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    info "systemd 服务文件已创建: $SERVICE_FILE"
+}
+
+enable_service() {
+    if [ ! -f "$SERVICE_FILE" ]; then
+        create_service
+    fi
+    systemctl enable "$SERVICE_NAME"
+    systemctl start "$SERVICE_NAME"
+    info "服务已启用并启动，正在验证服务器状态..."
+    sleep 5
+    deep_status_check
+}
+
+disable_service() {
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+    info "服务已停止并禁用。"
+}
+
+delete_service() {
+    disable_service
+    rm -f "$SERVICE_FILE"
+    systemctl daemon-reload
+    info "服务文件已删除。"
+}
+
+internal_status_check() {
+    local config_port=$(get_config_port)
+    local detect_port=$(detect_game_port)
+    local svc_active=0
+    local proc_exist=0
+    local port_listen=0
+
+    systemctl is-active --quiet "$SERVICE_NAME" && svc_active=1
+    pgrep -f "ProjectZomboid64" >/dev/null && proc_exist=1
+
+    if [ $proc_exist -eq 1 ]; then
+        if cmd_exists ss; then
+            ss -tlnp 2>/dev/null | grep -q ":$config_port " && port_listen=1
+            [ $port_listen -eq 0 ] && ss -tlnp 2>/dev/null | grep -q ":$detect_port " && port_listen=1
+        elif cmd_exists netstat; then
+            netstat -tlnp 2>/dev/null | grep -q ":$config_port " && port_listen=1
+            [ $port_listen -eq 0 ] && netstat -tlnp 2>/dev/null | grep -q ":$detect_port " && port_listen=1
+        fi
+    fi
+
+    if [ $svc_active -eq 1 ] && [ $proc_exist -eq 1 ] && [ $port_listen -eq 1 ]; then
+        return 0
+    elif [ $svc_active -eq 0 ]; then
+        if [ $proc_exist -eq 1 ] && [ $port_listen -eq 1 ]; then
+            return 4
+        else
+            return 1
+        fi
+    elif [ $proc_exist -eq 0 ]; then
+        return 2
+    else
+        return 3
+    fi
+}
+
+deep_status_check() {
+    local config_port=$(get_config_port)
+    local detect_port=$(detect_game_port)
+    local udp_port=$(get_config_udp_port)
+    local svc_active=0
+    local proc_exist=0
+    local port_listen=0
+    local log_error=0
+
+    systemctl is-active --quiet "$SERVICE_NAME" && svc_active=1
+    pgrep -f "ProjectZomboid64" >/dev/null && proc_exist=1
+
+    if [ $proc_exist -eq 1 ]; then
+        if cmd_exists ss; then
+            ss -tlnp 2>/dev/null | grep -q ":$config_port " && port_listen=1
+            [ $port_listen -eq 0 ] && ss -tlnp 2>/dev/null | grep -q ":$detect_port " && port_listen=1
+        elif cmd_exists netstat; then
+            netstat -tlnp 2>/dev/null | grep -q ":$config_port " && port_listen=1
+            [ $port_listen -eq 0 ] && netstat -tlnp 2>/dev/null | grep -q ":$detect_port " && port_listen=1
+        fi
+    fi
+
+    local log_dir="$PZ_HOME/Zomboid/Logs"
+    local recent_log=$(ls -t "$log_dir"/*_DebugLog-server.txt 2>/dev/null | head -1)
+    if [ -n "$recent_log" ]; then
+        if tail -n 100 "$recent_log" | grep -qE "FATAL|Exception in thread|Server failed to start"; then
+            log_error=1
+        fi
+    fi
+
+    echo ""
+    echo "=========================================="
+    echo "           服务器健康检查报告             "
+    echo "=========================================="
+    echo "systemd 服务状态 : $([ $svc_active -eq 1 ] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}")"
+    echo "游戏主进程       : $([ $proc_exist -eq 1 ] && echo -e "${GREEN}存在${NC}" || echo -e "${RED}缺失${NC}")"
+    echo "配置文件 TCP端口 : ${config_port}"
+    echo "配置文件 UDP端口 : ${udp_port}"
+    echo "智能探测 TCP端口 : ${detect_port}"
+    echo "端口监听状态     : $([ $port_listen -eq 1 ] && echo -e "${GREEN}正常监听${NC}" || echo -e "${RED}未监听${NC}")"
+    echo "日志错误检测     : $([ $log_error -eq 0 ] && echo -e "${GREEN}未发现严重异常${NC}" || echo -e "${YELLOW}发现严重错误${NC}")"
+    echo "=========================================="
+
+    if [ $port_listen -eq 0 ] && [ $proc_exist -eq 1 ]; then
+        echo "当前进程监听的所有 TCP 端口:"
+        local pid=$(pgrep -f "ProjectZomboid64")
+        if [ -n "$pid" ]; then
+            ss -tlnp 2>/dev/null | grep "$pid" || netstat -tlnp 2>/dev/null | grep "$pid" || echo "  无法获取详细信息"
+        fi
+        echo ""
+    fi
+
+    if [ $svc_active -eq 1 ] && [ $proc_exist -eq 1 ] && [ $port_listen -eq 1 ] && [ $log_error -eq 0 ]; then
+        info "✅ 服务器运行正常，可以连接。"
+    elif [ $svc_active -eq 1 ] && [ $proc_exist -eq 1 ] && [ $port_listen -eq 1 ]; then
+        warn "⚠️ 服务器运行中，但日志中发现错误，请检查配置或模组。"
+    elif [ $svc_active -eq 0 ] && [ $proc_exist -eq 1 ] && [ $port_listen -eq 1 ]; then
+        warn "⚠️ 服务器进程正在运行，但未通过 systemd 管理。"
+        echo "如果您是手动启动的，可继续使用；"
+        echo "若希望由 systemd 管理，请先停止当前进程，然后执行菜单中的“启用并启动服务”。"
+    elif [ $proc_exist -eq 1 ] && [ $port_listen -eq 0 ]; then
+        warn "⚠️ 游戏进程存在，但端口未监听。"
+        echo "可能原因及建议："
+        echo "  1. 服务器仍在启动中，请稍后重试。"
+        echo "  2. 配置端口 ${config_port} 未生效，但探测到进程使用了其他端口，"
+        echo "     若上述端口列表中有对外端口（监听 0.0.0.0 或 *），"
+        echo "     请更新配置文件中的 DefaultPort 值或检查启动参数。"
+        echo "  3. 防火墙或 SELinux 阻止了端口绑定。"
+        if [ -n "$recent_log" ]; then
+            echo ""
+            echo "最新日志片段 (${recent_log}):"
+            tail -5 "$recent_log"
+        fi
+    else
+        error "❌ 服务器未能完全启动，请检查日志文件。"
+        if [ -n "$recent_log" ]; then
+            echo "最近日志: $recent_log"
+            echo "最后 10 行内容:"
+            tail -10 "$recent_log"
+        fi
+    fi
+    echo ""
+}
+
+view_status() {
+    deep_status_check
+    read -p "按回车键返回主菜单..."
+}
+
+# ----------------------------- 前台运行 --------------------------------------
+run_foreground() {
+    step "前台运行服务器（调试模式）"
+    
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        warn "后台 systemd 服务正在运行，前台运行可能导致端口冲突。"
+        read -p "是否停止后台服务？(y/N): " stop_confirm
+        if [[ "$stop_confirm" =~ ^[Yy]$ ]]; then
+            systemctl stop "$SERVICE_NAME"
+            info "后台服务已停止。"
+        else
+            info "已取消前台运行。"
+            return
+        fi
+    fi
+
+    if [ ! -d "$GAME_DIR" ] || [ ! -f "$GAME_DIR/start-server.sh" ]; then
+        error "游戏目录或启动脚本不存在，请先安装/更新游戏。"
+        return
+    fi
+
+    info "正在切换到游戏目录并启动服务器（前台模式）..."
+    echo "=========================================="
+    echo "  服务器将在前台运行，日志将实时显示。"
+    echo "  按 Ctrl + C 可停止服务器并返回菜单。"
+    echo "=========================================="
+    echo ""
+    
+    cd "$GAME_DIR"
+    sudo -u "$PZ_USER" bash start-server.sh
+
+    echo ""
+    info "前台服务器已停止，返回主菜单。"
+    read -p "按回车键继续..."
+}
+
+# ----------------------------- 实时查看日志 ----------------------------------
+view_logs() {
+    step "实时查看服务器日志"
+    
+    local log_dir="${PZ_HOME}/Zomboid/Logs"
+    if [ ! -d "$log_dir" ]; then
+        warn "日志目录不存在: $log_dir"
+        info "可能服务器尚未启动过，请先启动服务器生成日志。"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+
+    local log_file=$(ls -t "$log_dir"/*_DebugLog-server.txt 2>/dev/null | head -1)
+    if [ -z "$log_file" ]; then
+        log_file=$(ls -t "$log_dir"/*.txt 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$log_file" ]; then
+        warn "未找到任何日志文件。"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+
+    echo ""
+    echo "=========================================="
+    echo "  实时日志查看器                          "
+    echo "=========================================="
+    echo "  日志文件: $log_file"
+    echo "  按 Ctrl + C 停止查看并返回菜单"
+    echo "=========================================="
+    echo ""
+
+    if [ -r "$log_file" ]; then
+        tail -f "$log_file" 2>/dev/null || {
+            error "无法读取日志文件，权限不足。"
+            read -p "按回车键返回主菜单..."
+        }
+    else
+        error "日志文件不可读，请检查权限。"
+        read -p "按回车键返回主菜单..."
+    fi
+
+    echo ""
+    info "已停止日志查看。"
+    read -p "按回车键返回主菜单..."
+}
+
+# ----------------------------- 定时任务管理 ----------------------------------
+enable_cron() {
+    step "启用定时自动修复（每5分钟）"
+    local script_path=$(readlink -f "$0")
+    local CRON_CMD="*/5 * * * * $script_path --check >> /var/log/pz_autoheal.log 2>&1 $CRON_MARKER"
+    
+    if crontab -l 2>/dev/null | grep -q "$CRON_MARKER"; then
+        warn "定时任务已存在，无需重复添加。"
+    else
+        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
+        info "定时任务已添加。每5分钟自动检测并修复服务器状态。"
+        info "日志文件: /var/log/pz_autoheal.log"
+        echo "建议配置 logrotate 管理该日志，避免无限增长。"
+    fi
+    read -p "按回车键继续..."
+}
+
+disable_cron() {
+    step "禁用定时自动修复"
+    if crontab -l 2>/dev/null | grep -q "$CRON_MARKER"; then
+        crontab -l 2>/dev/null | grep -v "$CRON_MARKER" | crontab -
+        info "定时任务已移除。"
+    else
+        warn "未找到定时任务，无需操作。"
+    fi
+    read -p "按回车键继续..."
+}
+
+manual_heal() {
+    step "检测服务器状态并自动修复"
+    internal_status_check
+    local status=$?
+    
+    case $status in
+        0)
+            info "✅ 服务器运行正常，无需操作。"
+            ;;
+        1|2|3)
+            warn "服务器状态异常，正在尝试重启服务..."
+            systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+            sleep 2
+            systemctl start "$SERVICE_NAME"
+            info "服务已重启。"
+            ;;
+        4)
+            warn "服务器正在运行但不受 systemd 管理，将跳过修复。"
+            info "若需要纳入 systemd 管理，请先停止当前进程再启用服务。"
+            ;;
+    esac
+
+    if [ $status -ne 0 ] && [ $status -ne 4 ]; then
+        sleep 5
+        internal_status_check
+        if [ $? -eq 0 ]; then
+            info "✅ 服务器已成功启动并正常运行。"
+        else
+            error "❌ 服务器未能正常启动，请检查日志。"
+        fi
+    fi
+    echo ""
+    read -p "按回车键继续..."
+}
+
+submenu_autoheal() {
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "         自动修复与定时任务管理           "
+        echo "=========================================="
+        echo "  1) 手动执行一次检测并修复"
+        echo "  2) 启用定时自动修复（每5分钟）"
+        echo "  3) 禁用定时自动修复"
+        echo "  4) 返回主菜单"
+        echo "=========================================="
+        read -p "请输入选项数字: " sub_choice
+
+        case $sub_choice in
+            1) manual_heal ;;
+            2) enable_cron ;;
+            3) disable_cron ;;
+            4) return ;;
+            *) error "无效选项，请重新输入。" ;;
+        esac
+    done
+}
+
+# ----------------------------- 删除存档（路径校验优化）--------------------------------------
+delete_map() {
+    step "删除存档"
+    local save_base="$SAVE_DIR"
+    
+    if [ ! -d "$save_base" ]; then
+        warn "存档目录不存在: $save_base"
+        return
+    fi
+
+    local maps=()
+    while IFS= read -r dir; do
+        maps+=("$dir")
+    done < <(find "$save_base" -maxdepth 1 -type d ! -path "$save_base" -printf "%f\n" 2>/dev/null | sort)
+
+    if [ ${#maps[@]} -eq 0 ]; then
+        warn "没有找到任何存档。"
+        return
+    fi
+
+    echo "现有存档列表："
+    for i in "${!maps[@]}"; do
+        printf "  %2d) %s\n" $((i+1)) "${maps[$i]}"
+    done
+    echo "   0) 取消"
+
+    local choice
+    while true; do
+        read -p "请输入要删除的存档编号: " choice
+        if [[ "$choice" == "0" ]]; then
+            info "取消删除。"
+            return
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#maps[@]} ]; then
+            break
+        else
+            error "无效编号，请重新输入。"
+        fi
+    done
+
+    local selected="${maps[$((choice-1))]}"
+    local target="$save_base/$selected"
+
+    if [[ "$target" != "$save_base"/* ]]; then
+        error "路径校验失败，中止删除。"
+        return
+    fi
+
+    echo ""
+    echo "即将删除存档: $selected"
+    echo "完整路径: $target"
+    read -p "确认删除并重启服务器？(y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        info "取消删除。"
+        return
+    fi
+
+    local was_running=false
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        was_running=true
+        info "检测到后台服务正在运行，将先停止服务..."
+        systemctl stop "$SERVICE_NAME"
+        sleep 3
+    else
+        info "服务器当前未运行。"
+    fi
+
+    rm -rf "$target"
+    info "存档 '$selected' 已删除。"
+
+    if [ "$was_running" = true ]; then
+        info "等待 15 秒后重新启动服务器..."
+        for i in {15..1}; do
+            printf "\r  剩余 %2d 秒..." "$i"
+            sleep 1
+        done
+        printf "\r\033[K"
+        systemctl start "$SERVICE_NAME"
+        
+        local game_port=$(get_config_port)
+        info "服务器已启动，等待端口 ${game_port} 监听（最多 60 秒）..."
+
+        local count=0
+        while [ $count -lt 60 ]; do
+            if ss -tlnp 2>/dev/null | grep -q ":$game_port " || netstat -tlnp 2>/dev/null | grep -q ":$game_port "; then
+                info "✅ 服务器端口 ${game_port} 已监听，启动成功！"
+                break
+            fi
+            sleep 2
+            count=$((count + 2))
+        done
+        if [ $count -ge 60 ]; then
+            error "❌ 服务器启动超时，端口 ${game_port} 未监听。请检查日志。"
+        fi
+        deep_status_check
+    else
+        info "服务器未重新启动（之前未运行）。"
+    fi
+
+    read -p "按回车键返回主菜单..."
+}
+
+# ----------------------------- 首次启动引导 ----------------------------------
+first_run_wizard() {
+    if [ ! -f "$SERVER_CONFIG" ]; then
+        echo ""
+        echo "============================================================"
+        echo "  ⚠️  检测到服务器尚未进行首次初始化！"
+        echo "============================================================"
+        echo "  游戏服务器在首次启动时需要生成默认配置文件，"
+        echo "  并且会提示您设置管理员密码。"
+        echo ""
+        echo "  接下来将自动进入前台启动模式，请根据屏幕提示操作："
+        echo "    - 看到 'Admin password' 提示时输入两次密码"
+        echo "    - 完成后按 Ctrl + C 停止服务器并返回菜单"
+        echo "============================================================"
+        echo ""
+        read -p "按回车键继续..."
+
+        run_foreground
+
+        if [ -f "$SERVER_CONFIG" ]; then
+            info "配置文件已生成，首次初始化完成。"
+        else
+            warn "未检测到配置文件，可能初始化未完成，请稍后重试。"
+        fi
+        echo ""
+        read -p "按回车键返回主菜单..."
+    fi
+}
+
+# ----------------------------- 主菜单 ----------------------------------------
+main_menu() {
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "         Project Zomboid 服务器管理        "
+        echo "=========================================="
+        echo "【systemd 服务管理】"
+        echo "  1) 创建/更新 systemd 服务"
+        echo "  2) 启用并启动服务（开机自启）"
+        echo "  3) 停止并禁用服务"
+        echo "  4) 查看服务运行状态（健康检查）"
+        echo "  5) 删除 systemd 服务文件"
+        echo ""
+        echo "【其他功能】"
+        echo "  6) 更新/安装游戏"
+        echo "  7) 修改服务器配置文件"
+        echo "  8) 删除存档并重启服务器"
+        echo "  9) 前台运行服务器（调试模式）"
+        echo " 10) 自动修复与定时任务管理"
+        echo " 11) 实时查看服务器日志"
+        echo " 12) 设置游戏中文语言（修改 ProjectZomboid64.json）"
+        echo ""
+        echo "  0) 退出脚本"
+        echo "=========================================="
+        read -p "请输入选项数字: " choice
+
+        case $choice in
+            1) create_service ;;
+            2) enable_service ;;
+            3) disable_service ;;
+            4) view_status ;;
+            5) delete_service ;;
+            6) choose_login; update_game ;;
+            7) modify_config ;;
+            8) delete_map ;;
+            9) run_foreground ;;
+            10) submenu_autoheal ;;
+            11) view_logs ;;
+            12) set_game_language ;;
+            0) info "退出脚本。"; exit 0 ;;
+            *) error "无效选项。" ;;
+        esac
+    done
+}
+
+# ----------------------------- 入口 ------------------------------------------
+main() {
+    detect_distro
+    check_user
+    check_environment
+
+    info "PZ 服务器管理脚本 v6.4 启动"
+
+    if [ ! -d "$GAME_DIR" ] || [ ! -f "$GAME_DIR/start-server.sh" ]; then
+        warn "游戏服务端未安装，开始初始化..."
+        init_steamcmd
+        choose_login
+        update_game
+    else
+        info "检测到游戏已安装。"
+    fi
+
+    first_run_wizard
+    main_menu
+}
+
+# ----------------------------- 命令行参数（已修复端口检测）-----------------------------------
+if [ "$1" = "--check" ] || [ "$1" = "-c" ]; then
+    detect_distro
+    check_user
+    internal_status_check
+    status=$?
+    if [ $status -eq 1 ] || [ $status -eq 2 ] || [ $status -eq 3 ]; then
+        echo "[$(date)] 服务器状态异常，尝试自动修复..."
+        systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        sleep 2
+        systemctl start "$SERVICE_NAME"
+    elif [ $status -eq 4 ]; then
+        echo "[$(date)] 服务器运行正常（但不受 systemd 管理），跳过修复。"
+    else
+        echo "[$(date)] 服务器运行正常。"
+    fi
+    exit 0
+fi
+
+main "$@"
+EOF
